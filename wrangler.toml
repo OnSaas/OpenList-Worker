@@ -19,7 +19,7 @@ ENVIRONMENT = "production"
 #         避免大 JSON 读写与单 key 过大（需下方 KV binding 或 EdgeOne Blob）
 # d1    - Cloudflare D1（需下方 [[d1_databases]] 绑定）
 # mysql - 外部 MySQL（仅 Node 容器运行时，需 MYSQL_URL 或 MYSQL_* 分项）
-DB_DRIVER = "d1"
+DB_DRIVER = "json"
 
 # ===================== json 后端存储方案（DB_JSON_BACKEND）=====================
 # 仅 DB_DRIVER = "json" 时生效；取值（大小写不敏感）：
@@ -27,7 +27,7 @@ DB_DRIVER = "d1"
 # 示例：改用 json 后端并强制走 KV binding：
 #   DB_DRIVER = "json"
 #   DB_JSON_BACKEND = "kv"
-# DB_JSON_BACKEND = "auto"
+DB_JSON_BACKEND = "kv"
 
 # ===================== KV / Blob 存储 =====================
 # 自定义 KV binding 名（json/kv 模式；不设则自动探测 KV/EDGEONE_KV/EO_KV 等）
@@ -62,15 +62,16 @@ DB_DRIVER = "d1"
 # 内存 JSON 数据库（仅测试/本地调试用，重启即失）
 # DATABASE_JSON = ""
 
-# D1 部署不绑 KV，避免 wrangler 自动建多余 namespace
-# [[kv_namespaces]]
-# binding = "KV"
+[[kv_namespaces]]
+binding = "KV"
+id = "a5816882d5304c1b9a5458c1ee7ac4df"
 
 # ===================== D1 =====================
-[[d1_databases]]
-binding = "DB"
-database_name = "openlist"
-database_id = "8f28d2bd-4cfa-44b4-9732-6ad7ee704d87"
+# 已迁 KV，D1 绑定去掉
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "openlist"
+# database_id = ""
 
 
 
