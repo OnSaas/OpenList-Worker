@@ -1,10 +1,10 @@
 /**
  * KV 驱动（自动适配 Cloudflare / EdgeOne）
- * 
+ *
  * 支持两种模式：
  * 1. Binding 模式：直接访问 KV binding（Cloudflare Workers / EdgeOne Edge Functions）
  * 2. HTTP 代理模式：通过 Edge Function 代理访问（EdgeOne Node Functions）
- * 
+ *
  * 自动检测环境并选择合适的模式。
  */
 import { sanitizeProxyOrigin } from "../proxy"
@@ -54,15 +54,48 @@ function getKvBinding(env?: any): any | null {
  *     形成循环依赖；
  *  2. 打包产物中不能依赖源码相对路径的动态 import。
  *
- * 因此 KV 代理模式要求显式配置 JWT_SECRET（>=16 字符）。
+ * 因此 KV 代理模式要求显式配置 JWT_SECRET（推荐 32+ 字符，不强制长度）。
  */
 function getProxySecret(env?: EnvContext): string | null {
   try {
     const s = env?.JWT_SECRET
-    return typeof s === "string" && s.length >= 16 ? s : null
+    // 只要求「非空」，不再强制 >=16：
+    //   - 强制长度会把用户合法设置的短密钥判成「未配置」，进而报一个
+    //     看起来无关的 NO_STORAGE / PROXY_CONFIG 错误，误导排查方向；
+    //   - 密钥强度是**运维建议**（推荐 32+ / openssl rand -hex 32），
+    //     不是程序可以替他决定的门槛。此处与 db.ts:readEnvEncryptionKey
+    //     的策略保持一致，避免同一变量在不同路径下长度要求不同。
+    return typeof s === "string" && s.trim().length > 0 ? s : null
   } catch {
     return null
   }
+}
+
+/**
+ * 当前环境是否有充分依据启用 EdgeOne KV HTTP 代理探测。
+ *
+ * `__requestOrigin` 不能作为平台依据：index.ts 会给所有平台和自托管请求注入它。
+ * 旧实现只要同时看到 origin 与 JWT_SECRET，就会在 DB_DRIVER=auto 时请求当前站点
+ * 的 /kv-list；没有该代理的站点若恰好把未知路径回退成 HTML 200，便会被误判为
+ * KV 可用，随后把 HTML 当 JSON 读取，并让 /env_check 错报 ready=true。
+ *
+ * 只有以下情况才允许无 binding 的代理模式：
+ *  1. 用户显式指定 DB_DRIVER=kv；
+ *  2. 用户显式提供 EO_KV_URLS；
+ *  3. EdgeOne Node 云函数的可靠 SCF 运行时标记存在。
+ */
+function shouldProbeProxy(env?: any): boolean {
+  const configured = String(env?.DB_DRIVER || "")
+    .trim()
+    .toLowerCase()
+  const procEnv: any =
+    typeof process !== "undefined" ? (process as any).env || {} : {}
+  return Boolean(
+    configured === "kv" ||
+    env?.EO_KV_URLS ||
+    env?.TENCENTCLOUD_SCF_FUNCTIONNAME ||
+    procEnv.TENCENTCLOUD_SCF_FUNCTIONNAME,
+  )
 }
 
 /**
@@ -70,7 +103,7 @@ function getProxySecret(env?: EnvContext): string | null {
  *
  * Triggered when all of the following hold:
  *  1. The current env has no KV binding, so the HTTP proxy must be used.
- *  2. No JWT_SECRET (>= 16 chars) is configured, so the proxy cannot be
+ *  2. No JWT_SECRET is configured at all, so the proxy cannot be
  *     authenticated.
  *
  * The combination "no binding + proxy required" only occurs on EdgeOne Node
@@ -89,14 +122,13 @@ export function checkProxyConfig(env?: any): string | null {
   }
 
   return (
-    "KV proxy mode requires the JWT_SECRET " +
-    "environment variable with at least 16 characters.\n" +
+    "KV proxy mode requires the JWT_SECRET environment variable to be set.\n" +
     "Reason: EdgeOne Node Functions cannot access KV directly and must go " +
     "through an Edge Function proxy, whose authentication depends on this " +
     "secret.\n" +
     "Add it under Environment Variables in the EdgeOne project settings, for " +
     "example:\n" +
-    "  JWT_SECRET=<random string of 32+ characters>\n" +
+    "  JWT_SECRET=<random string, 32+ characters recommended>\n" +
     "Generate one with: openssl rand -hex 32"
   )
 }
@@ -159,7 +191,8 @@ function getProxyBaseUrl(env?: EnvContext): string {
  * 判定：HTTP 200 表示代理与 KV 均可用；401 表示代理可达但鉴权失败，
  * 属于「代理部署存在但密钥不对」。
  *
- * 注意两个调用方对 401 的取舍不同，故这里只返回原始探测结果：
+ * 注意两个调用方对 401 的取舍不同，故这里只返回原始探测结果，
+ * 由 probeToAvailability() / probeToHealth() 分别映射（见其注释）：
  *   - isAvailable() 把 401 视为可用（代理已部署，驱动可被选中）
  *   - health() 把 401 视为不可用（鉴权失败，持久化不可依赖）
  */
@@ -195,6 +228,31 @@ async function probeProxy(
 }
 
 /**
+ * 把「原始探测结果」映射为**可用性**（`isAvailable` 的语义）。
+ *
+ * 401 视为可用：代理已部署，只是密钥不匹配 —— 此时应让 kv 被选中，
+ * 再由 `health()` 报出不健康。若这里判为不可用，`auto` 会悄悄换用别的后端，
+ * 而用户明明配了 KV 代理，只会更困惑。
+ */
+function probeToAvailability(probe: { ok: boolean; status: number }): boolean {
+  return probe.ok || probe.status === 401
+}
+
+/**
+ * 把「原始探测结果」映射为**健康状态**（`health()` 的语义）。
+ *
+ * 401 视为不健康：对依赖持久化的接口而言，鉴权失败就是不能读写，
+ * `/env_check` 不应把它判成 ready。
+ *
+ * 两者对 401 的取舍**不同且是有意为之**。抽成具名函数是为了让这个差异
+ * 在调用点显式可见，而不是散落在 `!probe.ok && probe.status !== 401`
+ * 这类字面表达式里（那需要读者反推语义）。
+ */
+function probeToHealth(probe: { ok: boolean }): boolean {
+  return probe.ok
+}
+
+/**
  * 解析代理基础 URL，无法确定时抛出明确错误。
  *
  * 集中校验「密钥 + origin」两个前置条件，避免各方法重复检查，
@@ -227,9 +285,13 @@ export const kvDriver: Driver = {
     }
 
     // 模式2: HTTP 代理（EdgeOne Node Functions 拿不到 binding）
+    // __requestOrigin 本身不能证明代理存在；auto 模式下必须有显式配置或
+    // EdgeOne Node 的平台标记，否则未知路由的 HTML 200 会造成假阳性。
+    if (!shouldProbeProxy(env)) return false
     const probe = await probeProxy(env)
-    if (!probe.ok && probe.status !== 401) {
-      if (probe.error) console.error("[DB] KV proxy unavailable: " + probe.error)
+    if (!probeToAvailability(probe)) {
+      if (probe.error)
+        console.error("[DB] KV proxy unavailable: " + probe.error)
       return false
     }
     return true
@@ -241,7 +303,7 @@ export const kvDriver: Driver = {
 
   async get(key: string, env?: any): Promise<string | null> {
     const kv = getKvBinding(env)
-    
+
     // 模式1: Binding 模式
     if (kv) {
       // Cloudflare KV 用 get(key, "text")，EdgeOne KV 用 get(key, {type:"text"})，
@@ -281,7 +343,7 @@ export const kvDriver: Driver = {
       // 绑定误返回对象时统一序列化，保持 Driver.get 的 string 契约
       return JSON.stringify(value)
     }
-    
+
     // 模式2: HTTP 代理模式（无原生 binding → 经 Edge Function 代理）
     const baseUrl = requireProxyBaseUrl(env)
     const url = `${baseUrl}/kv-get?key=${encodeURIComponent(key)}`
@@ -299,7 +361,7 @@ export const kvDriver: Driver = {
         throw new Error(`KV proxy get failed: ${response.status}`)
       }
 
-      const data = await response.json() as { value?: string | null }
+      const data = (await response.json()) as { value?: string | null }
       // 归一化为 string | null：Edge Function 在错误分支只返回 { error }，
       // 此时 data.value 为 undefined，不能直接透传（调用方按 === null 判断会漏掉）。
       if (data?.value === undefined || data?.value === null) return null
@@ -312,13 +374,13 @@ export const kvDriver: Driver = {
 
   async put(key: string, value: string, env?: any): Promise<void> {
     const kv = getKvBinding(env)
-    
+
     // 模式1: Binding 模式
     if (kv) {
       await kv.put(key, value)
       return
     }
-    
+
     // 模式2: HTTP 代理模式
     const baseUrl = requireProxyBaseUrl(env)
     const url = `${baseUrl}/kv-put`
@@ -341,13 +403,13 @@ export const kvDriver: Driver = {
 
   async delete(key: string, env?: any): Promise<void> {
     const kv = getKvBinding(env)
-    
+
     // 模式1: Binding 模式
     if (kv) {
       await kv.delete(key)
       return
     }
-    
+
     // 模式2: HTTP 代理模式
     const baseUrl = requireProxyBaseUrl(env)
     const url = `${baseUrl}/kv-delete?key=${encodeURIComponent(key)}`
@@ -369,7 +431,7 @@ export const kvDriver: Driver = {
 
   async list(prefix: string, env?: any): Promise<string[]> {
     const kv = getKvBinding(env)
-    
+
     // 模式1: Binding 模式
     if (kv) {
       // EdgeOne KV list() 语义（依据官方 functions-kv 示例）：
@@ -399,7 +461,7 @@ export const kvDriver: Driver = {
 
       return keys
     }
-    
+
     // 模式2: HTTP 代理模式
     const baseUrl = requireProxyBaseUrl(env)
     const url = `${baseUrl}/kv-list?prefix=${encodeURIComponent(prefix)}`
@@ -414,7 +476,7 @@ export const kvDriver: Driver = {
         throw new Error(`KV proxy list failed: ${response.status}`)
       }
 
-      const data = await response.json() as { keys: string[] }
+      const data = (await response.json()) as { keys: string[] }
       return data.keys || []
     } catch (err) {
       console.error(`[KV] list(${prefix}) failed:`, err)
@@ -424,7 +486,7 @@ export const kvDriver: Driver = {
 
   async health(env?: any): Promise<any> {
     const kv = getKvBinding(env)
-    
+
     // 模式1: Binding 模式
     if (kv) {
       try {
@@ -444,14 +506,15 @@ export const kvDriver: Driver = {
         }
       }
     }
-    
+
     // 模式2: HTTP 代理模式。
     //
-    // 判定比 isAvailable 更严格：健康状态必须真正可读写，401 表示鉴权
-    // 失败（代理在但密钥不对），对依赖持久化的接口而言应报不可用，
-    // 而不是被 /env_check 判定为 ready。共用 probeProxy 仅复用探测动作。
+    // 判定比 isAvailable 更严格（见 probeToHealth / probeToAvailability 的注释）：
+    // 健康状态必须真正可读写，401 表示鉴权失败（代理在但密钥不对），对依赖
+    // 持久化的接口而言应报不可用，而不是被 /env_check 判定为 ready。
+    // 共用 probeProxy 仅复用探测动作，语义映射分别具名。
     const probe = await probeProxy(env)
-    if (!probe.ok) {
+    if (!probeToHealth(probe)) {
       return {
         driver: "kv",
         mode: "proxy",
